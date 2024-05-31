@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/ban-ts-comment */
-import { Injectable, NgZone } from '@angular/core';
+import { ExperimentalPendingTasks, Injectable, NgZone, inject } from '@angular/core';
 import {
   Observable,
   Operator,
@@ -80,6 +80,7 @@ class BlockUntilFirstOperator<T> implements Operator<T, T> {
 export class ɵAngularFireSchedulers {
   public readonly outsideAngular: ɵZoneScheduler;
   public readonly insideAngular: ɵZoneScheduler;
+  public readonly pendingTasks = inject(ExperimentalPendingTasks);
 
   constructor(public ngZone: NgZone) {
     // @ts-ignore
@@ -102,10 +103,6 @@ provideFirebaseApp) or you're calling an AngularFire method outside of an NgModu
 
 function runOutsideAngular<T>(fn: (...args: any[]) => T): T {
   return getSchedulers().ngZone.runOutsideAngular(() => fn());
-}
-
-function run<T>(fn: (...args: any[]) => T): T {
-  return getSchedulers().ngZone.run(() => fn());
 }
 
 export function observeOutsideAngular<T>(obs$: Observable<T>): Observable<T> {
@@ -143,73 +140,63 @@ export function ɵkeepUnstableUntilFirstFactory(schedulers: ɵAngularFireSchedul
   };
 }
 
-// @ts-ignore
-const zoneWrapFn = (it: (...args: any[]) => any, macrotask: MacroTask|undefined) => {
-  // eslint-disable-next-line @typescript-eslint/no-this-alias
-  const _this = this;
-  // function() is needed for the arguments object
-  return function() {
-    const _arguments = arguments;
-    if (macrotask) {
-      setTimeout(() => {
-        if (macrotask.state === 'scheduled') {
-          macrotask.invoke();
-        }
-      }, 10);
-    }
-    return run(() => it.apply(_this, _arguments));
-  };
-};
+/**
+ * Creates a pending tasks and returns a callback that can be used to complete it.
+ * Optionally takes a timeout, in ms, to delay the completion of the task after the callback is invoked.
+ */
+export function createPendingTask(timeout?: number): VoidFunction {
+  const taskDone = getSchedulers().pendingTasks.add();
+  return timeout !== undefined ? () => setTimeout(taskDone, timeout) : taskDone;
+}
 
-export const ɵzoneWrap = <T= unknown>(it: T, blockUntilFirst: boolean): T => {
-  // function() is needed for the arguments object
-  return function() {
-    // @ts-ignore
-    let macrotask: MacroTask | undefined;
-    const _arguments = arguments;
-    // if this is a callback function, e.g, onSnapshot, we should create a microtask and invoke it
-    // only once one of the callback functions is tripped.
-    for (let i = 0; i < arguments.length; i++) {
-      if (typeof _arguments[i] === 'function') {
-        if (blockUntilFirst) {
-          // @ts-ignore
-          macrotask ||= run(() => Zone.current.scheduleMacroTask('firebaseZoneBlock', noop, {}, noop, noop));
-        }
-        // TODO create a microtask to track callback functions
-        _arguments[i] = zoneWrapFn(_arguments[i], macrotask);
-      }
-    }
-    const ret = runOutsideAngular(() => (it as any).apply(this, _arguments));
+// TODO: Rename to reflect the fact that this no longer depends on Zone.js.
+/**
+ * Wraps a function to run outside of Angular and block until the first result is available.
+ */
+export const ɵzoneWrap = <T = unknown>(it: T, blockUntilFirst: boolean): T => {
+  return ((...args: unknown[]) => {
+    // Always run callback outside of Angular.
+    const ret = runOutsideAngular(() => (it as any)(...args));
+
+    // If no blocking is needed, return the result immediately.
     if (!blockUntilFirst) {
-      if (ret instanceof Observable) {
-        const schedulers = getSchedulers();
-        return ret.pipe(
-          subscribeOn(schedulers.outsideAngular),
-          observeOn(schedulers.insideAngular),
-        );
-      } else {
-        return run(() => ret);
-      }
+      return ret;
     }
-    if (ret instanceof Observable) {
-      return ret.pipe(keepUnstableUntilFirst) as any;
-    } else if (ret instanceof Promise) {
-      // eslint-disable-next-line @typescript-eslint/no-misused-promises
-      return run(() => new Promise((resolve, reject) => ret.then(it => run(() => resolve(it)), reason => run(() => reject(reason)))));
-    } else if (typeof ret === 'function' && macrotask) {
-      // Handle unsubscribe
-      // function() is needed for the arguments object
-      return function() {
-        setTimeout(() => {
-          if (macrotask && macrotask.state === 'scheduled') {
-            macrotask.invoke();
+
+    // Wrap any callback arguments, e.g. for `onSnapshot`, to block until one of the callbacks is invoked.
+    const argTaskDone = createPendingTask(10);
+    args = args.map((arg) =>
+      typeof arg === "function"
+        ? (...wrapperArgs: unknown[]) => {
+            argTaskDone();
+            arg(...wrapperArgs);
           }
-        }, 10);
-        return ret.apply(this, arguments);
+        : arg
+    );
+
+    // Check the type of the return value and wrap it to block accordingly.
+    const taskDone = createPendingTask(10);
+    if (ret instanceof Observable) {
+      // Wrap observables to block until the first value emission, error, or completion.
+      // Schedule asynchronously always to ensure that firebase emissions are never synchronous.
+      return ret.pipe(
+        tap({next: taskDone, error: taskDone, complete: taskDone}),
+        subscribeOn(queueScheduler),
+        observeOn(asyncScheduler),
+      );
+    } else if (ret instanceof Promise) {
+      // Wrap promises to block until the promise is resolved or rejected.
+      return ret.finally(taskDone);
+    } else if (typeof ret === 'function') {
+      // Wrap functions to block until the function is invoked.
+      return (...args: unknown[]) => {
+        taskDone();
+        return ret(...args);
       };
     } else {
-      // TODO how do we handle storage uploads in Zone? and other stuff with cancel() etc?
-      return run(() => ret);
+      // TODO: How do we handle storage uploads and other stuff with `cancel()`, etc.?
+      taskDone();
+      return ret;
     }
-  } as any;
-};
+  }) as T;
+}
