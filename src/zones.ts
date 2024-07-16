@@ -33,9 +33,13 @@ export class ɵZoneScheduler implements SchedulerLike {
     // Wrap the specified work function to make sure that if nested scheduling takes place the
     // work is executed in the correct zone
     const workInZone = function(this: SchedulerAction<any>, state: any) {
-      targetZone.runGuarded(() => {
+      if (targetZone) {
+        targetZone.runGuarded(() => {
+          work.apply(this, [state]);
+        });
+      } else {
         work.apply(this, [state]);
-      });
+      }
     };
 
     // Scheduling itself needs to be run in zone to ensure setInterval calls for async scheduling are done
@@ -73,11 +77,14 @@ export class ɵAngularFireSchedulers {
   constructor(public ngZone: NgZone, public pendingTasks: ExperimentalPendingTasks) {
     this.outsideAngular = ngZone.runOutsideAngular(
       // @ts-ignore
-      () => new ɵZoneScheduler(Zone.current)
+      () => new ɵZoneScheduler(typeof Zone === 'undefined' ? undefined : Zone.current)
     );
     this.insideAngular = ngZone.run(
       // @ts-ignore
-      () => new ɵZoneScheduler(Zone.current, asyncScheduler)
+      () => new ɵZoneScheduler(
+        typeof Zone === 'undefined' ? undefined : Zone.current,
+        asyncScheduler
+      )
     );
     globalThis.ɵAngularFireScheduler ||= this;
   }
