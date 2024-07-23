@@ -179,29 +179,35 @@ export const ɵzoneWrap = <A extends unknown[], R>(
 ): ((...args: A) => R) => {
   return (...args: A) => {
     let taskDone: VoidFunction | undefined;
-    // if this is a callback function, e.g, onSnapshot, we should create a pending task and complete it
-    // only once one of the callback functions is tripped.
+
+    // If this is a callback function, e.g, onSnapshot, we need to wrap each user callback to run in
+    // the NgZone, and if we're blocking, take out a pending task that we resolve once one of the
+    // callback functions is tripped.
     for (let i = 0; i < args.length; i++) {
       if (typeof args[i] === 'function') {
         if (blockUntilFirst) {
           taskDone ||= createPendingTask(10);
         }
-        // TODO create a microtask to track callback functions
         args[i] = zoneWrapFn(args[i] as () => unknown, taskDone);
       }
     }
+
+    // Run the function outside the NgZone, passing the wrapped arguments.
     const ret = runOutsideAngular(() => it.apply(this, args));
+
+    // If we're not blocking we don't need to take out a pending task.
     if (!blockUntilFirst) {
       if (ret instanceof Observable) {
-        const schedulers = getSchedulers();
-        return ret.pipe(
-          subscribeOn(schedulers.outsideAngular),
-          observeOn(schedulers.insideAngular)
-        );
+        // Note: this was originally using the `outsideAngular` and `insideAngular` schedulers to
+        // subscribe outside the `NgZone`, but observe insdie the `NgZone`. We shouldn't need that
+        // anymore, but I'm leaving the schedulers that those delegate to in place for now, in order
+        // to avoid changing the timing.
+        return ret.pipe(subscribeOn(queueScheduler), observeOn(asyncScheduler));
       } else {
-        return run(() => ret);
+        return ret;
       }
     }
+
     if (ret instanceof Observable) {
       return ret.pipe(keepUnstableUntilFirst);
     } else if (ret instanceof Promise) {
