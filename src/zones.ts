@@ -50,27 +50,21 @@ export class ɵZoneScheduler implements SchedulerLike {
 }
 
 class BlockUntilFirstOperator<T> implements Operator<T, T> {
-  constructor(
-    private zone: any,
-    private pendingTasks: ExperimentalPendingTasks
-  ) {}
-
   call(subscriber: Subscriber<T>, source: Observable<T>): TeardownLogic {
-    const taskDone: VoidFunction = this.zone.run(() => this.pendingTasks.add());
     // maybe this is a race condition, invoke in a timeout
     // hold for 10ms while I try to figure out what is going on
-    const unscheduleTask = () => setTimeout(taskDone, 10);
+    const taskDone = createPendingTask(10);
 
     return source
       .pipe(
         tap({
-          next: unscheduleTask,
-          complete: unscheduleTask,
-          error: unscheduleTask,
+          next: taskDone,
+          complete: taskDone,
+          error: taskDone,
         })
       )
       .subscribe(subscriber)
-      .add(unscheduleTask);
+      .add(taskDone);
   }
 }
 
@@ -147,9 +141,7 @@ export function ɵkeepUnstableUntilFirstFactory(
   return function keepUnstableUntilFirst<T>(
     obs$: Observable<T>
   ): Observable<T> {
-    obs$ = obs$.lift(
-      new BlockUntilFirstOperator(schedulers.ngZone, schedulers.pendingTasks)
-    );
+    obs$ = obs$.lift(new BlockUntilFirstOperator());
 
     return obs$.pipe(
       // Run the subscribe body outside of Angular (e.g. calling Firebase SDK to add a listener to a change event)
@@ -167,12 +159,19 @@ const zoneWrapFn = (
   taskDone: VoidFunction | undefined
 ) => {
   return (...args: any[]) => {
-    if (taskDone) {
-      setTimeout(taskDone, 10);
-    }
+    taskDone?.();
     return run(() => it.apply(this, args));
   };
 };
+
+/**
+ * Creates a pending tasks and returns a callback that can be used to complete it.
+ * Optionally takes a timeout, in ms, to delay the completion of the task after the callback is invoked.
+ */
+export function createPendingTask(timeout?: number): VoidFunction {
+  const taskDone = getSchedulers().pendingTasks.add();
+  return timeout !== undefined ? () => setTimeout(taskDone, timeout) : taskDone;
+}
 
 export const ɵzoneWrap = <A extends unknown[], R>(
   it: (...args: A) => R,
@@ -185,7 +184,7 @@ export const ɵzoneWrap = <A extends unknown[], R>(
     for (let i = 0; i < args.length; i++) {
       if (typeof args[i] === 'function') {
         if (blockUntilFirst) {
-          taskDone ||= run(() => getSchedulers().pendingTasks.add());
+          taskDone ||= createPendingTask(10);
         }
         // TODO create a microtask to track callback functions
         args[i] = zoneWrapFn(args[i] as () => unknown, taskDone);
@@ -218,7 +217,7 @@ export const ɵzoneWrap = <A extends unknown[], R>(
     } else if (typeof ret === 'function' && taskDone) {
       // Handle unsubscribe
       return (...innerArgs: unknown[]) => {
-        setTimeout(taskDone, 10);
+        taskDone();
         return ret.apply(this, innerArgs);
       };
     } else {
