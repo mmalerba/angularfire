@@ -125,33 +125,25 @@ export function observeInsideAngular<T>(obs$: Observable<T>): Observable<T> {
   return obs$.pipe(observeOn(getSchedulers().insideAngular));
 }
 
-export function keepUnstableUntilFirst<T>(obs$: Observable<T>): Observable<T> {
-  return ɵkeepUnstableUntilFirstFactory(getSchedulers())(obs$);
-}
-
 /**
  * Operator to block the zone until the first value has been emitted or the observable
  * has completed/errored. This is used to make sure that universal waits until the first
  * value from firebase but doesn't block the zone forever since the firebase subscription
  * is still alive.
  */
-export function ɵkeepUnstableUntilFirstFactory(
-  schedulers: ɵAngularFireSchedulers
-) {
-  return function keepUnstableUntilFirst<T>(
-    obs$: Observable<T>
-  ): Observable<T> {
-    obs$ = obs$.lift(new BlockUntilFirstOperator());
+export function keepUnstableUntilFirst<T>(obs$: Observable<T>): Observable<T> {
+  obs$ = obs$.lift(new BlockUntilFirstOperator());
 
-    return obs$.pipe(
-      // Run the subscribe body outside of Angular (e.g. calling Firebase SDK to add a listener to a change event)
-      subscribeOn(schedulers.outsideAngular),
-      // Run operators inside the angular zone (e.g. side effects via tap())
-      observeOn(schedulers.insideAngular)
-      // INVESTIGATE https://github.com/angular/angularfire/pull/2315
-      // share()
-    );
-  };
+  // Note: this was originally using the `outsideAngular` and `insideAngular` schedulers to
+  // subscribe outside the `NgZone`, but observe insdie the `NgZone`. We shouldn't need that
+  // anymore, but I'm leaving the schedulers that those delegate to in place for now, in order
+  // to avoid changing the timing.
+  return obs$.pipe(
+    subscribeOn(queueScheduler),
+    observeOn(asyncScheduler)
+    // INVESTIGATE https://github.com/angular/angularfire/pull/2315
+    // share()
+  );
 }
 
 const zoneWrapFn = (
@@ -178,7 +170,7 @@ export const ɵzoneWrap = <A extends unknown[], R>(
   blockUntilFirst: boolean
 ): ((...args: A) => R) => {
   return (...args: A) => {
-    let taskDone: VoidFunction | undefined;
+    let argsTaskDone: VoidFunction | undefined;
 
     // If this is a callback function, e.g, onSnapshot, we need to wrap each user callback to run in
     // the NgZone, and if we're blocking, take out a pending task that we resolve once one of the
@@ -186,9 +178,9 @@ export const ɵzoneWrap = <A extends unknown[], R>(
     for (let i = 0; i < args.length; i++) {
       if (typeof args[i] === 'function') {
         if (blockUntilFirst) {
-          taskDone ||= createPendingTask(10);
+          argsTaskDone ||= createPendingTask(10);
         }
-        args[i] = zoneWrapFn(args[i] as () => unknown, taskDone);
+        args[i] = zoneWrapFn(args[i] as () => unknown, argsTaskDone);
       }
     }
 
@@ -209,26 +201,25 @@ export const ɵzoneWrap = <A extends unknown[], R>(
     }
 
     if (ret instanceof Observable) {
+      // If we're blocking and about to return an `Observable`, keep Angular unstable until we
+      // receive the first value.
       return ret.pipe(keepUnstableUntilFirst);
     } else if (ret instanceof Promise) {
-      return run(
-        () =>
-          new Promise((resolve, reject) => {
-            ret.then(
-              (it) => run(() => resolve(it)),
-              (reason) => run(() => reject(reason))
-            );
-          })
-      );
-    } else if (typeof ret === 'function' && taskDone) {
-      // Handle unsubscribe
+      // If we're blocking and about to return a `Promise`, take out an pending task and complete
+      // it when the promise resolves.
+      const taskDone = createPendingTask();
+      return ret.finally(taskDone);
+    } else if (typeof ret === 'function' && argsTaskDone) {
+      // If we're blocking and about to return an unsubscribe function, make sure to complete the
+      // task we took out earlier, for the arguments, on unsubscribe.
       return (...innerArgs: unknown[]) => {
-        taskDone();
+        argsTaskDone();
         return ret.apply(this, innerArgs);
       };
     } else {
-      // TODO how do we handle storage uploads in Zone? and other stuff with cancel() etc?
-      return run(() => ret);
+      // We're blocking but there's nothing to wait for, so just return.
+      // TODO: how do we handle storage uploads in Zone? and other stuff with cancel() etc?
+      return ret;
     }
   };
 };
